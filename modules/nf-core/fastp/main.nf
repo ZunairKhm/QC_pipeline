@@ -1,8 +1,8 @@
 process FASTP {
     tag "$meta.id"
     label 'process_medium'
-    publishDir "${params.outdir}/fastp_log", mode: 'copy', pattern: "*.html"
-    publishDir "${params.outdir}/processed_reads", mode: 'copy', pattern: "*.fastp.fastq.gz"
+    publishDir "${params.outdir}/fastp_log", mode: 'copy', pattern: "*.json"
+    //publishDir "${params.outdir}/processed_reads", mode: 'copy', pattern: "*.fastp.fastq.gz" //change this to symlink or comment out if reads are not needed
 
     conda "${moduleDir}/environment.yml"
     container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?

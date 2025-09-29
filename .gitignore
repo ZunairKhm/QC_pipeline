@@ -5,3 +5,7 @@
 results
 singularity
 data
+sbatch.txt
+.gitignore
+slurm*
+/combine_tsv.sh

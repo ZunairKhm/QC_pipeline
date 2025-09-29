@@ -116,19 +116,19 @@ sylph_query_ch = SYLPH_QUERY(FASTP.out.reads, sylph_99_db_ch)
         tuple val(meta), path("*.fastq.gz"), emit: reads    
 
         errorStrategy 'retry'
-        maxRetries 3
+        maxRetries 10
         maxErrors '-1' 
 
         script:
         """
-        kingfisher get -r ${accession} -m ena-ftp aws-http --output-directory . -t $task.cpus
+        kingfisher get -r ${accession} -m ena-ascp ena-ftp aws-http --output-directory . -t $task.cpus -f "fastq.gz"
         """
     }
 
 process DEACON_FILTER {
     tag "$meta.id"
     publishDir "${params.outdir}/deacon_log",  mode: 'copy', pattern: "*.deacon.log"
-    //publishDir "${params.outdir}/processed_reads", mode: 'copy', pattern: "*filt*.fq.gz" //change this to symlink or comment out if reads are not needed
+    //publishDir "${params.outdir}/processed_reads", mode: 'copy', pattern: "*filt*.fq.gz" 
 
     input:
     tuple val(meta), path(fq_files)
