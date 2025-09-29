@@ -1,4 +1,5 @@
-# Nextflow pipeline for preprocessing metagenomic reads and running through sylph profile and query. Edit nextflow.config to change work directory, deacon index location, and sylph database locations. 
+# Nextflow pipeline for preprocessing metagenomic reads and running through sylph profile and query. 
+Edit nextflow.config to change work directory, deacon index location, and sylph database locations. 
 ```bash
 module load Nextflow/x.x.x
 module load GCCcore/x.x.x
