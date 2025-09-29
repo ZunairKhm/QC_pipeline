@@ -1,7 +1,7 @@
-process SYLPH_PROFILE {
+process SYLPH_QUERY {
     tag "$meta.id"
     label 'process_high'
-    publishDir "${params.outdir}/sylph_profile", mode: 'copy', pattern: "*.tsv"
+    publishDir "${params.outdir}/sylph_query", mode: 'copy', pattern: "*.tsv"
 
     conda "${moduleDir}/environment.yml"
     container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
@@ -13,7 +13,7 @@ process SYLPH_PROFILE {
     path(database)
 
     output:
-    tuple val(meta), path('*.tsv'), emit: profile_out
+    tuple val(meta), path('*.tsv'), emit: query_out
     path "versions.yml"           , emit: versions
 
     when:
@@ -24,7 +24,7 @@ process SYLPH_PROFILE {
     def prefix = task.ext.prefix ?: "${meta.id}"
     def input = meta.single_end ? "${reads}" : "-1 ${reads[0]} -2 ${reads[1]}"
     """
-    sylph profile \\
+    sylph query \\
         -t $task.cpus \\
         $args \\
         $database\\

@@ -2,10 +2,10 @@
     nextflow.enable.dsl=2
 
     include { FASTP } from './modules/nf-core/fastp/main'
-    include { SYLPH_PROFILE } from './modules/nf-core/sylph/profile/main'        
+    include { SYLPH_PROFILE } from './modules/nf-core/sylph/profile/main' 
+    include { SYLPH_QUERY } from './modules/nf-core/sylph/query/main'               
 
-    params.input_method   = null
-    params.accessions     = null
+    params.kingfisher   = null
     params.filepath       = null
     params.outdir         = 'results'
 
@@ -14,15 +14,15 @@
 
         reads_ch = Channel.empty()
 
-        if (params.input_method == 'kingfisher' && params.accessions) {
+        if (params.kingfisher && !params.filepath) {
 
-            def acc_file = file(params.accessions)
+            def acc_file = file(params.kingfisher)
 
             accessions_ch = acc_file.exists()
                 ? Channel.fromPath(acc_file)
                         .splitCsv(header: false)
                         .map { row -> tuple([id: row[0]], row[0]) }
-                : Channel.from(params.accessions.split(','))
+                : Channel.from(params.kingfisher.split(','))
                         .map { acc -> tuple([id: acc], acc) }
 
             KINGFISHER_GET(accessions_ch)
@@ -34,7 +34,7 @@
                     tuple([id: meta.id, single_end: fq_list.size() == 1], fq_list)
                 }
 
-    } else if (params.input_method == 'directory' && params.filepath) {
+    } else if (params.filepath && !params.kingfisher) {
         
 
             def fastq_dir = file(params.filepath)
@@ -56,7 +56,7 @@
 
         }
     else {
-        error "No valid input source specified. Use --input_method with required parameters."
+        error "No valid input source specified. Use either --kingfisher and a file of line separated accessions or list accessions directly, or --directory and a file path to a directory containing fastq files."
     }
 
     reads_ch.view { meta, files -> "Raw file recieved: ${meta.id} -> ${files*.name}" }
@@ -83,16 +83,24 @@
     //fastp_ch.reads.view { meta, files -> "FASTP output: ${meta.id} -> ${files*.name}" }
 
 // Path to Sylph database
-sylph_db_ch = Channel.value(file(params.sylph_db))
+sylph_95_db_ch = Channel.value(file(params.sylph_95_db))
+sylph_99_db_ch = Channel.value(file(params.sylph_99_db))
 
 // Run Sylph
-sylph_ch = SYLPH_PROFILE(FASTP.out.reads, sylph_db_ch)
+sylph_profile_ch = SYLPH_PROFILE(FASTP.out.reads, sylph_95_db_ch)
+sylph_query_ch = SYLPH_QUERY(FASTP.out.reads, sylph_99_db_ch)
 
- sylph_ch.profile_out.view { meta, tsv_files ->
+    // View outputs
+    sylph_profile_ch.profile_out.view { meta, tsv_files ->
     "Sylph profile: ${meta.id} -> ${tsv_files*.name}"
-} 
-       
     }
+    sylph_query_ch.query_out.view { meta, tsv_files ->
+    "Sylph query: ${meta.id} -> ${tsv_files*.name}"
+    }
+
+    } // end workflow
+       
+    
 
 
     // ----------- Processes --------------
@@ -120,7 +128,7 @@ sylph_ch = SYLPH_PROFILE(FASTP.out.reads, sylph_db_ch)
 process DEACON_FILTER {
     tag "$meta.id"
     publishDir "${params.outdir}/deacon_log",  mode: 'copy', pattern: "*.deacon.log"
-    publishDir "${params.outdir}/processed_reads", mode: 'copy', pattern: "*filt*.fq.gz" //change this to symlink or comment out if reads are not needed
+    //publishDir "${params.outdir}/processed_reads", mode: 'copy', pattern: "*filt*.fq.gz" //change this to symlink or comment out if reads are not needed
 
     input:
     tuple val(meta), path(fq_files)

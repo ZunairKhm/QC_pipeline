@@ -2,6 +2,7 @@ process FASTP {
     tag "$meta.id"
     label 'process_medium'
     publishDir "${params.outdir}/fastp_log", mode: 'copy', pattern: "*.html"
+    publishDir "${params.outdir}/processed_reads", mode: 'copy', pattern: "*.fastp.fastq.gz"
 
     conda "${moduleDir}/environment.yml"
     container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
