@@ -56,7 +56,7 @@
 
         }
     else {
-        error "No valid input source specified. Use either --kingfisher and a file of line separated accessions or list accessions directly, or --directory and a file path to a directory containing fastq files."
+        error "No valid input source specified. Use either --kingfisher and a file of line separated accessions or list accessions directly, or --filepath and a file path to a directory containing fastq files."
     }
 
     reads_ch.view { meta, files -> "Raw file recieved: ${meta.id} -> ${files*.name}" }
