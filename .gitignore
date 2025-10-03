@@ -5,7 +5,6 @@
 results
 singularity
 data
-sbatch.txt
 .gitignore
 slurm*
-/combine_tsv.sh
+QC_pipeline.code-workspace
