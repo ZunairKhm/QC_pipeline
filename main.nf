@@ -116,7 +116,7 @@ sylph_query_ch = SYLPH_QUERY(FASTP.out.reads, sylph_99_db_ch)
         tuple val(meta), path("*.fastq.gz"), emit: reads    
 
         errorStrategy 'retry'
-        maxRetries 10
+        maxRetries 3
         maxErrors '-1' 
 
         script:

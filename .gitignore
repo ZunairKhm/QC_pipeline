@@ -3,6 +3,7 @@
 /.nextflow.log*
 /.vscode
 results
+work
 singularity
 data
 .gitignore
