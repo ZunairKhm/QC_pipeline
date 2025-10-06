@@ -19,7 +19,7 @@
 #SBATCH --mem=8GB
 
 # Use this email address:
-#SBATCH --mail-user=z.khurram@student.unimelb.edu.au
+#SBATCH --mail-user=zunair.khurram@petermac.org
 
 # Send yourself an email when the job:
 # aborts abnormally (fails)
@@ -47,4 +47,4 @@ module load singularity/4.1.0-slurm
 unset SBATCH_EXPORT
 
 # The job command(s):
-nextflow run main.nf --kingfisher accessions.txt  --resume
+nextflow run main.nf --filepath /scratch/pawsey1172/zkhurram/serine_project/raw_reads/250425_LH00444_0332_A2323YJLT3  --resume

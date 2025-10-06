@@ -107,7 +107,7 @@ sylph_query_ch = SYLPH_QUERY(FASTP.out.reads, sylph_99_db_ch)
 
     process KINGFISHER_GET {
         tag "$meta.id"
-        //publishDir "${params.outdir}/raw_data", mode: 'symlink'
+        //publishDir "${params.outdir}/raw_data", mode: 'copy'
 
         input:
         tuple val(meta), val(accession)
