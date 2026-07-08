@@ -3,11 +3,13 @@
 
     include { FASTP } from './modules/nf-core/fastp/main'
     include { SYLPH_PROFILE } from './modules/nf-core/sylph/profile/main' 
-    include { SYLPH_QUERY } from './modules/nf-core/sylph/query/main'               
+    include { SYLPH_QUERY } from './modules/nf-core/sylph/query/main'     
+    include { KRAKEN2_KRAKEN2 } from './modules/nf-core/kraken2/kraken2/main'          
 
     params.kingfisher   = null
     params.filepath       = null
     params.outdir         = 'results'
+    params.runkraken2     = false
 
 
     workflow {
@@ -83,8 +85,8 @@
     //fastp_ch.reads.view { meta, files -> "FASTP output: ${meta.id} -> ${files*.name}" }
 
 // Path to Sylph database
-sylph_95_db_ch = Channel.value(file(params.sylph_95_db))
-sylph_99_db_ch = Channel.value(file(params.sylph_99_db))
+sylph_95_db_ch = channel.value(file(params.sylph_95_db))
+sylph_99_db_ch = channel.value(file(params.sylph_99_db))
 
 // Run Sylph
 sylph_profile_ch = SYLPH_PROFILE(FASTP.out.reads, sylph_95_db_ch)
@@ -97,6 +99,16 @@ sylph_query_ch = SYLPH_QUERY(FASTP.out.reads, sylph_99_db_ch)
     sylph_query_ch.query_out.view { meta, tsv_files ->
     "Sylph query: ${meta.id} -> ${tsv_files*.name}"
     }
+
+if (params.runkraken2) {
+    KRAKEN2_KRAKEN2 ( 
+            FASTP.out.reads,                                 
+            file(params.kraken2_db),  
+            false,                                           // Don't save classified FASTQ files
+            false                                            // Don't save the massive raw assignment file
+        )
+}
+    
 
     } // end workflow
        

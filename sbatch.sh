@@ -19,15 +19,15 @@
 #SBATCH --mem=8GB
 
 # Use this email address:
-#SBATCH --mail-user=zunair.khurram@petermac.org
+# SBATCH --mail-user=zunair.khurram@petermac.org
 
 # Send yourself an email when the job:
 # aborts abnormally (fails)
-#SBATCH --mail-type=FAIL
+# SBATCH --mail-type=FAIL
 # begins
-#SBATCH --mail-type=BEGIN
+# SBATCH --mail-type=BEGIN
 # ends successfully
-#SBATCH --mail-type=END
+# SBATCH --mail-type=END
 
 # The maximum running time of the job in days-hours:mins:sec
 #SBATCH --time=02:0:00
@@ -41,10 +41,11 @@ fi
 # Run the job from the directory where it was launched (default)
 
 # The modules to load:
-module load nextflow/24.10.0
+module load gcc-native/14.2
 module load pawseyenv/2025.08
-module load singularity/4.1.0-slurm
+module load nextflow/25.04.6
+module load  singularity/4.1.0-slurm
 unset SBATCH_EXPORT
 
 # The job command(s):
-nextflow run main.nf --filepath /scratch/pawsey1172/zkhurram/serine_project/raw_reads/250425_LH00444_0332_A2323YJLT3  --resume
+nextflow run main.nf --kingfisher accessions.txt  --resume
