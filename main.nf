@@ -11,6 +11,8 @@
     params.outdir         = 'results'
     params.runkraken2     = false
 
+    params.filter_method = 'deacon' // Options: 'deacon' or 'nohuman'
+
 
     workflow {
 
@@ -63,19 +65,36 @@
 
     reads_ch.view { meta, files -> "Raw file recieved: ${meta.id} -> ${files*.name}" }
 
-    if (!params.deacon_index) {
-        error "Please provide --deacon_index"
+// ---------------------------------------------------------
+    // Filtering Logic (Deacon vs Nohuman)
+    // ---------------------------------------------------------
+    def filtered_reads_ch = Channel.empty()
+
+    if (params.filter_method == 'deacon') {
+        if (!params.deacon_index) {
+            error "Please provide --deacon_index when using filter_method 'deacon'"
+        }
+        deacon_index_ch = Channel.value(file(params.deacon_index))
+        
+        DEACON_FILTER(reads_ch, deacon_index_ch)
+        filtered_reads_ch = DEACON_FILTER.out.filtered_reads
+
+    } else if (params.filter_method == 'nohuman') {
+        if (!params.nohuman_db) {
+            error "Please provide --nohuman_db when using filter_method 'nohuman'"
+        }
+        nohuman_db_ch = Channel.value(file(params.nohuman_db))
+        
+        NOHUMAN_FILTER(reads_ch, nohuman_db_ch)
+        filtered_reads_ch = NOHUMAN_FILTER.out.filtered_reads
+
+    } else {
+        error "Invalid --filter_method specified. Must be 'deacon' or 'nohuman'."
     }
-
-    deacon_index_ch = Channel.value(file(params.deacon_index))
-
-    // Run DEACON
-    DEACON_FILTER(reads_ch, deacon_index_ch)
-    //deacon_ch.filtered_reads.view { meta, files -> "Deacon filtered: ${meta.id} -> ${files*.name}" }
 
     // Run FASTP
         FASTP(
-            DEACON_FILTER.out.filtered_reads,
+            filtered_reads_ch,
             [],  // adapter_fasta
             [],  // discard_trimmed_pass
             [],  // save_trimmed_fail
@@ -174,7 +193,34 @@ process DEACON_FILTER {
     """
 }
 
+process NOHUMAN_FILTER {
+    tag "$meta.id"
+    publishDir "${params.outdir}/nohuman_log", mode: 'copy', pattern: "*.report"
 
+    input:
+    tuple val(meta), path(fq_files)
+    path(nohuman_db)
+
+    output:
+    // nohuman natively appends 'nohuman' to the filename before .fastq.gz
+    tuple val(meta), path("*nohuman*.fq.gz"), emit: filtered_reads
+    tuple val(meta), path("*.report"), emit: nohuman_report
+
+    script:
+    def cmd
+    if (fq_files.size() == 2) {
+        cmd = "nohuman -D ${nohuman_db} -k ${meta.id}.kraken.out -r ${meta.id}.kraken.report ${fq_files[0]} ${fq_files[1]}"
+    } else {
+        cmd = "nohuman -D ${nohuman_db} -k ${meta.id}.kraken.out -r ${meta.id}.kraken.report ${fq_files[0]}"
+    }
+
+    """
+    echo "Processing sample: ${meta.id} with nohuman"
+    echo "Database: ${nohuman_db}"
+
+    $cmd
+    """
+}
 
 
 
