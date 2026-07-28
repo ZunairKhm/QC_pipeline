@@ -19,6 +19,7 @@ module load singularity/4.1.0-slurm
 nextflow run main.nf --kingfisher accessions.txt  --resume
 ```
 ## Notes:
+- Primarily set up for pawsey currently but can be modified to work for spartan and other HPCs.s
 - Publish directories need to be modified in each process (main.nf for deacon and kingfisher, and under modules for fastp, sylph profile, sylph query, and kraken). 
 - Kraken2 can be run optionally with the flag --runkraken2
 - nohuman can be run instead of deacon with the flag --filter_method="nohuman"

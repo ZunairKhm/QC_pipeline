@@ -18,17 +18,6 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8GB
 
-# Use this email address:
-# SBATCH --mail-user=zunair.khurram@petermac.org
-
-# Send yourself an email when the job:
-# aborts abnormally (fails)
-# SBATCH --mail-type=FAIL
-# begins
-# SBATCH --mail-type=BEGIN
-# ends successfully
-# SBATCH --mail-type=END
-
 # The maximum running time of the job in days-hours:mins:sec
 #SBATCH --time=02:0:00
 
