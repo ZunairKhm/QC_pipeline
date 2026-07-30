@@ -11,7 +11,7 @@
     params.outdir         = 'results'
     params.runkraken2     = false
 
-    params.filter_method = 'deacon' // Options: 'deacon' or 'nohuman'
+    params.filter_method = 'nohuman' // Options: 'deacon' or 'nohuman'
 
 
     workflow {

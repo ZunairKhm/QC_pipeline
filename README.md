@@ -22,7 +22,7 @@ nextflow run main.nf --kingfisher accessions.txt  --resume
 - Primarily set up for pawsey currently but can be modified to work for spartan and other HPCs.s
 - Publish directories need to be modified in each process (main.nf for deacon and kingfisher, and under modules for fastp, sylph profile, sylph query, and kraken). 
 - Kraken2 can be run optionally with the flag --runkraken2
-- nohuman can be run instead of deacon with the flag --filter_method="nohuman"
+- deacon can be run instead of nohuman with the flag --filter_method="deacon"
 - Unwanted steps can be commented out in the workflow section of main.nf.
 - Currently set up to run sylph profile and sylph query with different databases (gtdb 95 and 99) however that can be easily changed.
 - Currently set up for SLURM and Singularity (specifically for pawsey) but this can be modified in nextflow.config (look at commented out code). Remember to launch the pipeline with either sbatch or an interactive session (ideally on workflow nodes).
