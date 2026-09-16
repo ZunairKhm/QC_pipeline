@@ -22,6 +22,7 @@ nextflow run main.nf --kingfisher accessions.txt  --resume
 - Primarily set up for pawsey currently but can be modified to work for spartan and other HPCs.s
 - Publish directories need to be modified in each process (main.nf for deacon and kingfisher, and under modules for fastp, sylph profile, sylph query, and kraken). 
 - Kraken2 can be run optionally with the flag --runkraken2
+- TRACS align (strain-level transmission inference, https://github.com/gtonkinhill/tracs, docs: https://gthlab.au/tracs/#/alignment) can be run optionally with the flag --runtracsalign, aligning to the reference fasta file(s) given by --tracs_refseqs (no sourmash database is used, so alignment is direct to the given reference(s) with no on-the-fly genome downloads).
 - deacon can be run instead of nohuman with the flag --filter_method="deacon"
 - Unwanted steps can be commented out in the workflow section of main.nf.
 - Currently set up to run sylph profile and sylph query with different databases (gtdb 95 and 99) however that can be easily changed.
@@ -29,4 +30,5 @@ nextflow run main.nf --kingfisher accessions.txt  --resume
 - nf-boost cleanup would've been very useful for deleting intermediate files but it does not consistently work.
 - Maybe important to mention that I copied the available sylph-profile nf core module and swapped out "profile" for "query" to make a sylph-query module.
 - For every accession specified, the pipeline will duplicate the files downloaded twice so consider not specifying more than ~250GB worth of accessions for each run for every 1TB of space available. 
+- Each run writes `results/sample_manifest.tsv`, a PASS/FAIL grid of which samples produced output at each stage (failed samples are skipped rather than killing the run, so this is how you spot them). When running batches into a shared --outdir, pass --run_label <name> so each batch writes its own `sample_manifest.<name>.tsv` instead of overwriting the previous batch's.
 - Some utility scripts are provided: sbatch for running bracken (could be implemented into the pipeline but it took 5 mins to run across 100+ samples so its not too annoying); and some kraken and sylph utility scripts to merge the reports; and convert kraken to mpa format)

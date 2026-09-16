@@ -10,11 +10,68 @@
     params.filepath       = null
     params.outdir         = 'results'
     params.runkraken2     = false
+    params.runsylphquery  = false
+    params.runtracsalign  = false
 
-    params.filter_method = 'nohuman' // Options: 'deacon' or 'nohuman'
 
+    params.filter_method = 'nohuman' // Options: 'deacon' or 'nohuman' or 'none'
+
+    // Set --run_label when running batches into a shared --outdir, so each batch writes its
+    // own manifest instead of overwriting (and wiping) the previous batch's.
+    params.run_label = null
+
+    def runSuffix() { params.run_label ? ".${params.run_label}" : '' }
+
+    // Each stage drops a small file of the sample IDs that reached it into this directory;
+    // the onComplete handler reads them back to build the completion manifest.
+    def manifestDir() { "${params.outdir}/.manifest${runSuffix()}" }
+
+    def sampleIdsFrom(String name) {
+        def f = file("${manifestDir()}/${name}")
+        f.exists() ? f.readLines()*.trim().findAll { it } as Set : [] as Set
+    }
+
+    // Failed samples are skipped (errorStrategy 'ignore'), so compare the samples that
+    // entered the pipeline against those each stage actually produced output for.
+    // Must live in a function: `params`/`log` don't resolve inside the onComplete closure.
+    def writeSampleManifest() {
+        def all = sampleIdsFrom('all_samples.txt')
+        if (!all) {
+            log.warn "No samples were recorded - skipping completion manifest."
+            return
+        }
+
+        def stages = [
+            ['fastp', sampleIdsFrom('fastp_samples.txt')],
+            ['sylph_profile', sampleIdsFrom('sylph_profile_samples.txt')]
+        ]
+        if (params.runsylphquery) stages << ['sylph_query', sampleIdsFrom('sylph_query_samples.txt')]
+        if (params.runkraken2)    stages << ['kraken2', sampleIdsFrom('kraken2_samples.txt')]
+        if (params.runtracsalign) stages << ['tracs_align', sampleIdsFrom('tracs_align_samples.txt')]
+
+        def report = file("${params.outdir}/sample_manifest${runSuffix()}.tsv")
+        report.parent.mkdirs()
+        report.text = (
+            [(['sample_id'] + stages.collect { stage -> stage[0] }).join('\t')] +
+            all.sort().collect { id ->
+                ([id] + stages.collect { stage -> stage[1].contains(id) ? 'PASS' : 'FAIL' }).join('\t')
+            }
+        ).join('\n') + '\n'
+
+        log.info "Sample manifest: ${report}"
+        stages.each { stage ->
+            def missing = all - stage[1]
+            if (missing) {
+                log.warn "${missing.size()}/${all.size()} sample(s) produced no ${stage[0]} output: ${missing.sort().join(', ')}"
+            }
+        }
+    }
 
     workflow {
+
+        // Clear last run's stage files: collectFile writes nothing for a stage that produced
+        // no output, so stale files would otherwise be read back as false PASSes.
+        file(manifestDir()).deleteDir()
 
         reads_ch = Channel.empty()
 
@@ -64,6 +121,8 @@
     }
 
     reads_ch.view { meta, files -> "Raw file recieved: ${meta.id} -> ${files*.name}" }
+    reads_ch.map { meta, _files -> meta.id }
+        .collectFile(name: 'all_samples.txt', newLine: true, storeDir: manifestDir())
 
 // ---------------------------------------------------------
     // Filtering Logic (Deacon vs Nohuman)
@@ -88,6 +147,8 @@
         NOHUMAN_FILTER(reads_ch, nohuman_db_ch)
         filtered_reads_ch = NOHUMAN_FILTER.out.filtered_reads
 
+    } else if (params.filter_method == 'none') {
+        filtered_reads_ch = reads_ch
     } else {
         error "Invalid --filter_method specified. Must be 'deacon' or 'nohuman'."
     }
@@ -102,6 +163,8 @@
         )
 
     //fastp_ch.reads.view { meta, files -> "FASTP output: ${meta.id} -> ${files*.name}" }
+    FASTP.out.reads.map { meta, _reads -> meta.id }
+        .collectFile(name: 'fastp_samples.txt', newLine: true, storeDir: manifestDir())
 
 // Path to Sylph database
 sylph_95_db_ch = channel.value(file(params.sylph_95_db))
@@ -109,29 +172,63 @@ sylph_99_db_ch = channel.value(file(params.sylph_99_db))
 
 // Run Sylph
 sylph_profile_ch = SYLPH_PROFILE(FASTP.out.reads, sylph_95_db_ch)
+if (params.runsylphquery) {    
 sylph_query_ch = SYLPH_QUERY(FASTP.out.reads, sylph_99_db_ch)
+}
 
     // View outputs
     sylph_profile_ch.profile_out.view { meta, tsv_files ->
     "Sylph profile: ${meta.id} -> ${tsv_files*.name}"
     }
-    sylph_query_ch.query_out.view { meta, tsv_files ->
-    "Sylph query: ${meta.id} -> ${tsv_files*.name}"
+    sylph_profile_ch.profile_out.map { meta, _tsv_files -> meta.id }
+        .collectFile(name: 'sylph_profile_samples.txt', newLine: true, storeDir: manifestDir())
+
+    if (params.runsylphquery) {
+        sylph_query_ch.query_out.view { meta, tsv_files ->
+        "Sylph query: ${meta.id} -> ${tsv_files*.name}"
+        }
+        sylph_query_ch.query_out.map { meta, _tsv_files -> meta.id }
+            .collectFile(name: 'sylph_query_samples.txt', newLine: true, storeDir: manifestDir())
     }
 
+
 if (params.runkraken2) {
-    KRAKEN2_KRAKEN2 ( 
-            FASTP.out.reads,                                 
-            file(params.kraken2_db),  
+    KRAKEN2_KRAKEN2 (
+            FASTP.out.reads,
+            file(params.kraken2_db),
             false,                                           // Don't save classified FASTQ files
             false                                            // Don't save the massive raw assignment file
         )
+
+    KRAKEN2_KRAKEN2.out.report.map { meta, _report -> meta.id }
+        .collectFile(name: 'kraken2_samples.txt', newLine: true, storeDir: manifestDir())
 }
-    
+
+if (params.runtracsalign) {
+    if (!params.tracs_refseqs) {
+        error "Please provide --tracs_refseqs (path to reference fasta file(s)) when using --runtracsalign"
+    }
+    if (!params.tracs_database) {
+        error "Please provide --tracs_database (a sourmash .sbt.zip) when using --runtracsalign"
+    }
+    tracs_refseqs_ch  = Channel.value(file(params.tracs_refseqs))
+    tracs_database_ch = Channel.value(file(params.tracs_database))
+
+    TRACS_ALIGN(FASTP.out.reads, tracs_refseqs_ch, tracs_database_ch)
+
+    TRACS_ALIGN.out.align_out.view { meta, dir -> "TRACS align: ${meta.id} -> ${dir.name}" }
+    TRACS_ALIGN.out.align_out.map { meta, _dir -> meta.id }
+        .collectFile(name: 'tracs_align_samples.txt', newLine: true, storeDir: manifestDir())
+}
+
+
+    workflow.onComplete {
+        writeSampleManifest()
+    }
 
     } // end workflow
-       
-    
+
+
 
 
     // ----------- Processes --------------
@@ -140,15 +237,16 @@ if (params.runkraken2) {
         tag "$meta.id"
         //publishDir "${params.outdir}/raw_data", mode: 'copy'
 
+        // Retry transient download failures, then skip an accession that keeps failing
+        // (withdrawn/restricted). A plain 'retry' aborts the entire run once retries run out.
+        errorStrategy { task.attempt <= 3 ? 'retry' : 'ignore' }
+        maxRetries 3
+
         input:
         tuple val(meta), val(accession)
 
         output:
-        tuple val(meta), path("*.fastq.gz"), emit: reads    
-
-        errorStrategy 'retry'
-        maxRetries 3
-        maxErrors '-1' 
+        tuple val(meta), path("*.fastq.gz"), emit: reads
 
         script:
         """
@@ -222,6 +320,33 @@ process NOHUMAN_FILTER {
     """
 }
 
+process TRACS_ALIGN {
+    tag "$meta.id"
+    publishDir "${params.outdir}/tracs_align", mode: 'copy'
 
+    input:
+    tuple val(meta), path(fq_files)
+    path(tracs_refseqs)
+    path(tracs_database)
+
+    output:
+    tuple val(meta), path("${meta.id}"), emit: align_out
+
+    script:
+    def input_reads = fq_files instanceof List ? fq_files.join(' ') : fq_files
+    // $HOME is read-only in the container, so point matplotlib/fontconfig at the work dir
+    """
+    export MPLCONFIGDIR="\$PWD/.mplconfig"
+    export XDG_CACHE_HOME="\$PWD/.cache"
+
+    tracs align \\
+        -i ${input_reads} \\
+        --database ${tracs_database} \\
+        --refseqs ${tracs_refseqs} \\
+        -o ${meta.id} \\
+        -p ${meta.id} \\
+        -t $task.cpus
+    """
+}
 
 
