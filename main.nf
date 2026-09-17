@@ -26,6 +26,19 @@
     // the onComplete handler reads them back to build the completion manifest.
     def manifestDir() { "${params.outdir}/.manifest${runSuffix()}" }
 
+    // reads a "<unit>\t<v1>\t<v2>..." file from the manifest dir into unit -> column value
+    def unitColumnFrom(String name, int col) {
+        def f = file("${manifestDir()}/${name}")
+        def out = [:]
+        if (f.exists()) {
+            f.readLines().each { line ->
+                def parts = line.trim().split('\t')
+                if (parts.size() > col) out[parts[0]] = parts[col]
+            }
+        }
+        return out
+    }
+
     def sampleIdsFrom(String name) {
         def f = file("${manifestDir()}/${name}")
         f.exists() ? f.readLines()*.trim().findAll { it } as Set : [] as Set
@@ -49,14 +62,24 @@
         if (params.runkraken2)    stages << ['kraken2', sampleIdsFrom('kraken2_samples.txt')]
         if (params.runtracsalign) stages << ['tracs_align', sampleIdsFrom('tracs_align_samples.txt')]
 
+        // units are merged from one or more runs, so report that alongside the stage outcomes
+        def unitRuns   = unitColumnFrom('unit_runs.txt', 1)
+        def mergeState = unitColumnFrom('merge_status.txt', 3)
+
         def report = file("${params.outdir}/sample_manifest${runSuffix()}.tsv")
         report.parent.mkdirs()
         report.text = (
-            [(['sample_id'] + stages.collect { stage -> stage[0] }).join('\t')] +
+            [(['sample_id', 'runs', 'merge'] + stages.collect { stage -> stage[0] }).join('\t')] +
             all.sort().collect { id ->
-                ([id] + stages.collect { stage -> stage[1].contains(id) ? 'PASS' : 'FAIL' }).join('\t')
+                ([id, unitRuns.get(id, '1'), mergeState.get(id, 'single_run')] +
+                 stages.collect { stage -> stage[1].contains(id) ? 'PASS' : 'FAIL' }).join('\t')
             }
         ).join('\n') + '\n'
+
+        def partial = mergeState.findAll { _k, v -> v == 'PARTIAL' }.keySet()
+        if (partial) {
+            log.warn "${partial.size()} unit(s) merged from fewer runs than expected: ${partial.sort().join(', ')}"
+        }
 
         log.info "Sample manifest: ${report}"
         stages.each { stage ->
@@ -79,21 +102,91 @@
 
             def acc_file = file(params.kingfisher)
 
-            accessions_ch = acc_file.exists()
-                ? Channel.fromPath(acc_file)
-                        .splitCsv(header: false)
-                        .map { row -> tuple([id: row[0]], row[0]) }
-                : Channel.from(params.kingfisher.split(','))
-                        .map { acc -> tuple([id: acc], acc) }
+            // kingfisher annotate needs a file, so materialise a comma-separated list into one
+            accession_file_ch = acc_file.exists()
+                ? channel.fromPath(acc_file)
+                : channel.of(params.kingfisher.split(',') as List).flatten()
+                         .collectFile(name: 'accessions.txt', newLine: true)
 
-            KINGFISHER_GET(accessions_ch)
+            KINGFISHER_ANNOTATE(accession_file_ch)
 
-            reads_ch = KINGFISHER_GET.out.reads
-                .map { meta, fq_list ->
-                    fq_list = fq_list instanceof List ? fq_list : [fq_list]
-                    fq_list.sort()
-                    tuple([id: meta.id, single_end: fq_list.size() == 1], fq_list)
+            // One unit per sample. Runs of a sample are grouped by sample_accession; where a
+            // sample mixes paired and single runs the single ones are dropped, since the two
+            // layouts cannot be concatenated into one pair of files.
+            sample_rows_ch = KINGFISHER_ANNOTATE.out.tsv
+                .splitCsv(header: true, sep: '\t')
+                .map { row -> tuple(row.sample_accession, row) }
+                .groupTuple()
+
+            units_ch = sample_rows_ch.flatMap { sample, rows ->
+                def paired = rows.findAll { (it.library_layout ?: '').toUpperCase() != 'SINGLE' }
+                def keep   = paired ?: rows
+                def single_end = paired.isEmpty()
+                // name the unit after its first run accession; sorted so the id is stable
+                // across runs, otherwise -resume would miss every merged unit
+                def id = keep.collect { it.run }.sort().first()
+                keep.collect { r ->
+                    tuple(groupKey([id: id, single_end: single_end, n_runs: keep.size()], keep.size()), r.run)
                 }
+            }
+
+            units_ch
+                .map { key, run -> "${key.id}\t${run}\t${key.single_end}\t${key.n_runs}" }
+                .collectFile(name: "units${runSuffix()}.tsv", newLine: true, storeDir: "${params.outdir}/metadata",
+                             seed: "unit_id\trun\tsingle_end\tn_runs")
+
+            // record what the mixed-layout rule discarded, so the loss is visible
+            sample_rows_ch
+                .flatMap { sample, rows ->
+                    def paired = rows.findAll { (it.library_layout ?: '').toUpperCase() != 'SINGLE' }
+                    paired ? rows.findAll { (it.library_layout ?: '').toUpperCase() == 'SINGLE' }
+                                 .collect { "${sample}\t${it.run}\tsingle_end_run_in_mixed_sample" } : []
+                }
+                .collectFile(name: "dropped_runs${runSuffix()}.tsv", newLine: true, storeDir: "${params.outdir}/metadata",
+                             seed: "sample_accession\trun\treason")
+
+            units_ch
+                .map { key, _run -> "${key.id}\t${key.n_runs}" }
+                .unique()
+                .collectFile(name: 'unit_runs.txt', newLine: true, storeDir: manifestDir())
+
+            KINGFISHER_GET(units_ch)
+
+            // groupKey releases each unit as soon as its n_runs downloads land, rather than
+            // waiting for the whole accession list. remainder keeps partly-failed units.
+            grouped_ch = KINGFISHER_GET.out.reads
+                .groupTuple(by: 0, remainder: true)
+                .map { key, per_run -> tuple([id: key.id, single_end: key.single_end, n_runs: key.n_runs], per_run) }
+
+            // Only a unit that was *meant* to have one run skips merging. A multi-run unit
+            // reduced to one surviving download must still go through MERGE_RUNS, otherwise it
+            // would pass through looking complete with no PARTIAL record.
+            branched_ch = grouped_ch.branch { meta, per_run ->
+                one_run: per_run.size() == 1 && meta.n_runs == 1
+                many_runs: true
+            }
+
+            single_run_ch = branched_ch.one_run
+                .map { meta, per_run ->
+                    def fq = per_run.flatten().sort { a, b -> a.name <=> b.name }
+                    tuple([id: meta.id, single_end: fq.size() == 1], fq)
+                }
+
+            MERGE_RUNS(branched_ch.many_runs.map { meta, per_run ->
+                tuple(meta, per_run.flatten().sort { a, b -> a.name <=> b.name })
+            })
+
+            MERGE_RUNS.out.log
+                .splitCsv(header: true, sep: '\t')
+                .map { row -> "${row.unit_id}\t${row.expected_runs}\t${row.merged_runs}\t${row.status}" }
+                .collectFile(name: 'merge_status.txt', newLine: true, storeDir: manifestDir())
+
+            // a one-file glob yields a bare Path, not a list; downstream does fq_files.size()
+            merged_ch = MERGE_RUNS.out.merged.map { meta, fq ->
+                tuple([id: meta.id, single_end: meta.single_end], fq instanceof List ? fq : [fq])
+            }
+
+            reads_ch = single_run_ch.mix(merged_ch)
 
     } else if (params.filepath && !params.kingfisher) {
         
@@ -234,7 +327,7 @@ if (params.runtracsalign) {
     // ----------- Processes --------------
 
     process KINGFISHER_GET {
-        tag "$meta.id"
+        tag "$accession"
         //publishDir "${params.outdir}/raw_data", mode: 'copy'
 
         // Retry transient download failures, then skip an accession that keeps failing
@@ -349,4 +442,68 @@ process TRACS_ALIGN {
     """
 }
 
+process KINGFISHER_ANNOTATE {
+    tag "${accessions.name}"
+    publishDir "${params.outdir}/metadata", mode: 'copy'
 
+    // every unit is derived from this, so a silent skip here would empty the whole run
+    errorStrategy 'terminate'
+
+    input:
+    path(accessions)
+
+    output:
+    path("run_metadata.tsv"), emit: tsv
+
+    script:
+    """
+    kingfisher annotate --run-identifiers-list ${accessions} --all-columns -f tsv > run_metadata.tsv
+    """
+}
+
+process MERGE_RUNS {
+    tag "$meta.id"
+    publishDir "${params.outdir}/merge_logs", mode: 'copy', pattern: "*.merge.tsv"
+
+    input:
+    tuple val(meta), path(fq_files)
+
+    output:
+    tuple val(meta), path("${meta.id}*.fq.gz"), emit: merged
+    path "${meta.id}.merge.tsv"               , emit: log
+
+    script:
+    """
+    # gzip members concatenate directly, so this needs no decompression
+    shopt -s nullglob
+    r1=( *_1.fastq.gz ); r2=( *_2.fastq.gz ); se=()
+    for f in *.fastq.gz; do
+        case "\$f" in *_1.fastq.gz|*_2.fastq.gz) ;; *) se+=( "\$f" );; esac
+    done
+
+    if [ "${meta.single_end}" = "true" ]; then
+        if [ \${#r1[@]} -gt 0 ]; then
+            echo "ERROR: ${meta.id} is single-end but paired files were downloaded" >&2; exit 1
+        fi
+        cat "\${se[@]}" > ${meta.id}.fq.gz
+        merged=\${#se[@]}
+    else
+        if [ \${#r1[@]} -ne \${#r2[@]} ]; then
+            echo "ERROR: ${meta.id} has \${#r1[@]} R1 but \${#r2[@]} R2 files" >&2; exit 1
+        fi
+        if [ \${#se[@]} -gt 0 ]; then
+            echo "ERROR: ${meta.id} is paired-end but \${#se[@]} unpaired file(s) arrived" >&2; exit 1
+        fi
+        cat "\${r1[@]}" > ${meta.id}_1.fq.gz
+        cat "\${r2[@]}" > ${meta.id}_2.fq.gz
+        merged=\${#r1[@]}
+    fi
+
+    # a download skipped by errorStrategy 'ignore' would otherwise merge silently short
+    status=COMPLETE
+    [ "\$merged" -eq "${meta.n_runs}" ] || status=PARTIAL
+    printf 'unit_id\\texpected_runs\\tmerged_runs\\tlayout\\tstatus\\n' > ${meta.id}.merge.tsv
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "${meta.id}" "${meta.n_runs}" "\$merged" \\
+        "\$([ "${meta.single_end}" = "true" ] && echo single || echo paired)" "\$status" >> ${meta.id}.merge.tsv
+    """
+}

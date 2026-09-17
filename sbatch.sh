@@ -28,13 +28,22 @@ if [ "x$SLURM_JOB_ID" == "x" ]; then
 fi
 
 # Run the job from the directory where it was launched (default)
+# the singularity module unconditionally resets SINGULARITY_CACHEDIR to a path under
+# software_directory, clobbering the .bashrc export - re-set it here, after the module load
 
 # The modules to load:
 module load gcc-native/14.2
 module load pawseyenv/2025.08
 module load nextflow/25.04.6
 module load  singularity/4.1.0-slurm
+export SINGULARITY_CACHEDIR=/scratch/pawsey1172/zkhurram/.singularity_cache
+export NXF_SINGULARITY_CACHEDIR=/scratch/pawsey1172/zkhurram/.singularity_cache
+export NXF_HOME=~/scratch_directory/.nextflow
+export SINGULARITY_TMPDIR=/tmp
 unset SBATCH_EXPORT
 
+
+
+
 # The job command(s):
-nextflow run main.nf --kingfisher accessions.txt  --resume
+nextflow run main.nf --kingfisher accessions.txt  -resume
