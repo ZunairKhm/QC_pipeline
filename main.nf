@@ -222,7 +222,9 @@
     // ---------------------------------------------------------
     def filtered_reads_ch = Channel.empty()
 
-    if (params.filter_method == 'deacon') {
+    if (params.filter_method == 'none') {
+        filtered_reads_ch = reads_ch
+    } else if (params.filter_method == 'deacon') {
         if (!params.deacon_index) {
             error "Please provide --deacon_index when using filter_method 'deacon'"
         }
@@ -240,10 +242,8 @@
         NOHUMAN_FILTER(reads_ch, nohuman_db_ch)
         filtered_reads_ch = NOHUMAN_FILTER.out.filtered_reads
 
-    } else if (params.filter_method == 'none') {
-        filtered_reads_ch = reads_ch
-    } else {
-        error "Invalid --filter_method specified. Must be 'deacon' or 'nohuman'."
+    } else  {
+        error "Invalid --filter_method specified. Must be 'deacon', 'nohuman', or 'none'."
     }
 
     // Run FASTP
@@ -307,7 +307,24 @@ if (params.runtracsalign) {
     tracs_refseqs_ch  = Channel.value(file(params.tracs_refseqs))
     tracs_database_ch = Channel.value(file(params.tracs_database))
 
-    TRACS_ALIGN(FASTP.out.reads, tracs_refseqs_ch, tracs_database_ch)
+    // Reference selection is pulled out ahead of the alignment so the alignment's resource
+    // request can be sized from how much work it is actually about to do - see TRACS_GATHER.
+    TRACS_GATHER(FASTP.out.reads, tracs_database_ch)
+
+    tracs_sized_ch = TRACS_GATHER.out.sized.map { meta, fq, refcount, input_gb ->
+        def rc = refcount as Integer
+        tuple(meta, fq, rc, rc * (input_gb as Double))
+    }
+
+    // the inputs to the runtime model, kept because work dirs get cleaned up long before
+    // there is enough data to re-fit it
+    TRACS_GATHER.out.sized
+        .map { meta, _fq, refcount, input_gb -> "${meta.id}\t${refcount}\t${input_gb}" }
+        .collectFile(name: "tracs_sizing${runSuffix()}.tsv", newLine: true,
+                     storeDir: "${params.outdir}/metadata",
+                     seed: "sample\trefcount\tinput_gb")
+
+    TRACS_ALIGN(tracs_sized_ch, tracs_refseqs_ch, tracs_database_ch)
 
     TRACS_ALIGN.out.align_out.view { meta, dir -> "TRACS align: ${meta.id} -> ${dir.name}" }
     TRACS_ALIGN.out.align_out.map { meta, _dir -> meta.id }
@@ -413,12 +430,77 @@ process NOHUMAN_FILTER {
     """
 }
 
+// tracs align picks its references with sourmash and only then starts aligning, so how long
+// it will run is not knowable at submit time - and it varies by well over an order of
+// magnitude. Running just the reference-selection half up front makes it knowable: measured
+// across 759 completed aligns, runtime tracks (references x input GB) at r=0.987, so that
+// product is what sizes the alignment (see TRACS_ALIGN and params.tracs_work_* in
+// nextflow.config). Costs a duplicate gather - ~1.3 min per GB of input, sketch-dominated -
+// because tracs has no way to be handed a reference list it did not pick itself.
+process TRACS_GATHER {
+    tag "$meta.id"
+
+    input:
+    tuple val(meta), path(fq_files)
+    path(tracs_database)
+
+    output:
+    tuple val(meta), path(fq_files), env('REFCOUNT'), env('INPUT_GB'), emit: sized
+
+    script:
+    def fq_list     = fq_files instanceof List ? fq_files : [fq_files]
+    def input_reads = fq_list.join(' ')
+    def py_files    = fq_list.collect { "\"${it}\"" }.join(', ')
+    """
+    export MPLCONFIGDIR="\$PWD/.mplconfig"
+    export XDG_CACHE_HOME="\$PWD/.cache"
+    export TRACS_GATHER_CORES=\$(nproc)
+
+    # Calls tracs' own run_gather rather than reimplementing sketch+fastgather here. The
+    # reference list is not the gather csv, it is that csv after the p_match / coverage-ratio
+    # filter in utils.py - reimplementing the two commands alone counted 88 references on a
+    # sample tracs aligned 28 of. Going through the library keeps this count identical to the
+    # one align arrives at by construction, and keeps it that way if the filter changes.
+    python3 - <<'PY'
+import os, tempfile
+from zipfile import ZipFile
+from tracs.utils import run_gather, is_valid_sourmash_db
+
+outdir = os.path.join(os.getcwd(), "")
+temp_dir = os.path.join(tempfile.mkdtemp(dir=outdir), "")
+
+# same database resolution align does before it gathers
+db = "${tracs_database}"
+if is_valid_sourmash_db(db):
+    smdb = db
+else:
+    with ZipFile(db, "r") as archive:
+        archive.extract("sourmashDB.sbt.zip", temp_dir)
+        smdb = temp_dir + "sourmashDB.sbt.zip"
+
+refs = run_gather(
+    input_files=[${py_files}],
+    databasefile=smdb,
+    output=outdir + "${meta.id}_sourmash_hits",
+    temp_dir=temp_dir,
+)
+open("refcount.txt", "w").write(str(len(refs)))
+PY
+
+    export REFCOUNT=\$(cat refcount.txt)
+    # -L because the reads are symlinked in, so the link's own size is not the file's
+    export INPUT_GB=\$(stat -Lc%s ${input_reads} | awk '{s+=\$1} END {printf "%.4f", s/1e9}')
+
+    echo "sizing: \$REFCOUNT references, \$INPUT_GB GB input"
+    """
+}
+
 process TRACS_ALIGN {
     tag "$meta.id"
     publishDir "${params.outdir}/tracs_align", mode: 'copy'
 
     input:
-    tuple val(meta), path(fq_files)
+    tuple val(meta), path(fq_files), val(refcount), val(work_units)
     path(tracs_refseqs)
     path(tracs_database)
 
@@ -432,13 +514,38 @@ process TRACS_ALIGN {
     export MPLCONFIGDIR="\$PWD/.mplconfig"
     export XDG_CACHE_HOME="\$PWD/.cache"
 
+    # Pawsey grants cpus in proportion to the memory request, not the literal `cpus`
+    # directive - a 20GB request here is billed ~24 cores regardless of what's asked for.
+    # \$task.cpus only ever bakes in the literal directive (verified empirically: it stays
+    # at the requested value even when slurm inflates the real grant), and Nextflow's own
+    # singularity wrapper strips SLURM_CPUS_PER_TASK from the container's environment
+    # (it runs `env - PATH=... singularity exec ...`) - so neither reflects the true grant.
+    # nproc reads the cgroup CPU affinity directly, which is unaffected by either problem.
+    CORES=\$(nproc)
+
+    # the patched tracs runs branchwater fastgather for reference selection; its --cores
+    # defaults to every core on the node, so it is pinned to the real grant, not task.cpus
+    export TRACS_GATHER_CORES=\$CORES
+
+    # tracs aligns matched references one at a time by default; this runs several
+    # concurrently instead. 2 workers is the efficient default: on the worst measured sample
+    # it used fewer node-hours than higher worker counts while still cutting wall time ~3x -
+    # more workers finish a single job faster but use the node's paid-for share less
+    # efficiently across the whole batch. That trade only pays off where 2 workers would not
+    # finish inside the 24h the `work` queue allows, which TRACS_GATHER now tells us in
+    # advance, so the 5-worker bump goes to exactly those (benchmarked in
+    # /scratch/pawsey1172/zkhurram/tracs_v2_test/prod_run vs prod_run_w2 - cut the worst-case
+    # sample from 233min to 128min, peak mem 50.7GB vs 25GB; memory follows in
+    # nextflow.config). A retry means the estimate was low, so it bumps regardless.
+    export TRACS_ALIGN_WORKERS=${task.attempt > 1 || work_units >= params.tracs_work_boost ? 5 : 2}
+
     tracs align \\
         -i ${input_reads} \\
         --database ${tracs_database} \\
         --refseqs ${tracs_refseqs} \\
         -o ${meta.id} \\
         -p ${meta.id} \\
-        -t $task.cpus
+        -t \$CORES
     """
 }
 
