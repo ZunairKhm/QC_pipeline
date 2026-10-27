@@ -169,6 +169,12 @@
             single_run_ch = branched_ch.one_run
                 .map { meta, per_run ->
                     def fq = per_run.flatten().sort { a, b -> a.name <=> b.name }
+                    // ENA sometimes ships a third, unpaired file (<run>.fastq.gz) next to
+                    // <run>_1/_2; nohuman only takes one or two inputs, so without this the
+                    // orphan alone went through as a single-end sample. MERGE_RUNS already
+                    // drops such orphans for multi-run units.
+                    def mates = fq.findAll { it.name ==~ /.*_[12]\.fastq\.gz/ }
+                    if (mates.size() == 2) fq = mates
                     tuple([id: meta.id, single_end: fq.size() == 1], fq)
                 }
 
@@ -306,25 +312,29 @@ if (params.runtracsalign) {
     }
     tracs_refseqs_ch  = Channel.value(file(params.tracs_refseqs))
     tracs_database_ch = Channel.value(file(params.tracs_database))
+    // Patched tracs python package, laid over the container's copy via PYTHONPATH - see
+    // containers/tracs-align/README.md. Staged as an input so singularity binds it.
+    tracs_overlay_ch  = Channel.value(file("${projectDir}/containers/tracs-align/overlay"))
 
-    // Reference selection is pulled out ahead of the alignment so the alignment's resource
-    // request can be sized from how much work it is actually about to do - see TRACS_GATHER.
-    TRACS_GATHER(FASTP.out.reads, tracs_database_ch)
+    // Reference selection is pulled out ahead of the alignment: it records how much work
+    // each sample is (references x input GB) and its gather result is handed to the
+    // alignment so the reads are not sketched and gathered a second time.
+    TRACS_GATHER(FASTP.out.reads, tracs_database_ch, tracs_overlay_ch)
 
-    tracs_sized_ch = TRACS_GATHER.out.sized.map { meta, fq, refcount, input_gb ->
+    tracs_sized_ch = TRACS_GATHER.out.sized.map { meta, fq, csv, refcount, input_gb ->
         def rc = refcount as Integer
-        tuple(meta, fq, rc, rc * (input_gb as Double))
+        tuple(meta, fq, csv, rc, rc * (input_gb as Double))
     }
 
     // the inputs to the runtime model, kept because work dirs get cleaned up long before
     // there is enough data to re-fit it
     TRACS_GATHER.out.sized
-        .map { meta, _fq, refcount, input_gb -> "${meta.id}\t${refcount}\t${input_gb}" }
+        .map { meta, _fq, _csv, refcount, input_gb -> "${meta.id}\t${refcount}\t${input_gb}" }
         .collectFile(name: "tracs_sizing${runSuffix()}.tsv", newLine: true,
                      storeDir: "${params.outdir}/metadata",
                      seed: "sample\trefcount\tinput_gb")
 
-    TRACS_ALIGN(tracs_sized_ch, tracs_refseqs_ch, tracs_database_ch)
+    TRACS_ALIGN(tracs_sized_ch, tracs_refseqs_ch, tracs_database_ch, tracs_overlay_ch)
 
     TRACS_ALIGN.out.align_out.view { meta, dir -> "TRACS align: ${meta.id} -> ${dir.name}" }
     TRACS_ALIGN.out.align_out.map { meta, _dir -> meta.id }
@@ -430,22 +440,22 @@ process NOHUMAN_FILTER {
     """
 }
 
-// tracs align picks its references with sourmash and only then starts aligning, so how long
-// it will run is not knowable at submit time - and it varies by well over an order of
-// magnitude. Running just the reference-selection half up front makes it knowable: measured
-// across 759 completed aligns, runtime tracks (references x input GB) at r=0.987, so that
-// product is what sizes the alignment (see TRACS_ALIGN and params.tracs_work_* in
-// nextflow.config). Costs a duplicate gather - ~1.3 min per GB of input, sketch-dominated -
-// because tracs has no way to be handed a reference list it did not pick itself.
+// tracs align picks its references with sourmash and only then starts aligning. Running
+// just the reference-selection half up front records how much work each sample is
+// (references x input GB; before the read screen, runtime tracked that product at r=0.987
+// across 759 aligns) and, since the patched tracs accepts a precomputed gather csv
+// (TRACS_GATHER_CSV), the result is handed to TRACS_ALIGN rather than computed twice.
 process TRACS_GATHER {
     tag "$meta.id"
 
     input:
     tuple val(meta), path(fq_files)
     path(tracs_database)
+    path(tracs_overlay)
 
     output:
-    tuple val(meta), path(fq_files), env('REFCOUNT'), env('INPUT_GB'), emit: sized
+    // the gather csv goes to TRACS_ALIGN so it is not recomputed there
+    tuple val(meta), path(fq_files), path("${meta.id}_sourmash_hits.csv"), env('REFCOUNT'), env('INPUT_GB'), emit: sized
 
     script:
     def fq_list     = fq_files instanceof List ? fq_files : [fq_files]
@@ -455,6 +465,16 @@ process TRACS_GATHER {
     export MPLCONFIGDIR="\$PWD/.mplconfig"
     export XDG_CACHE_HOME="\$PWD/.cache"
     export TRACS_GATHER_CORES=\$(nproc)
+    # fastgather (branchwater), as batches 00-06 used, rather than upstream's classic gather:
+    # it can break ties differently and shift the reference set by one or two on diverse
+    # samples, but keeps new batches consistent with the old ones and avoids classic gather's
+    # 8-20 min (up to hours) single-threaded run. utils.py silently falls back to classic
+    # gather when the plugin is missing, so its absence is made an error here instead.
+    export TRACS_FASTGATHER=1
+    python3 -c 'import sourmash_plugin_branchwater' || { echo "sourmash_plugin_branchwater missing - fastgather unavailable" >&2; exit 1; }
+    # patched tracs package shadows the container's (see containers/tracs-align/README.md)
+    export PYTHONPATH="\$PWD/${tracs_overlay}"
+    export PYTHONDONTWRITEBYTECODE=1
 
     # Calls tracs' own run_gather rather than reimplementing sketch+fastgather here. The
     # reference list is not the gather csv, it is that csv after the p_match / coverage-ratio
@@ -500,9 +520,10 @@ process TRACS_ALIGN {
     publishDir "${params.outdir}/tracs_align", mode: 'copy'
 
     input:
-    tuple val(meta), path(fq_files), val(refcount), val(work_units)
+    tuple val(meta), path(fq_files), path(gather_csv), val(refcount), val(work_units)
     path(tracs_refseqs)
     path(tracs_database)
+    path(tracs_overlay)
 
     output:
     tuple val(meta), path("${meta.id}"), emit: align_out
@@ -523,21 +544,36 @@ process TRACS_ALIGN {
     # nproc reads the cgroup CPU affinity directly, which is unaffected by either problem.
     CORES=\$(nproc)
 
-    # the patched tracs runs branchwater fastgather for reference selection; its --cores
-    # defaults to every core on the node, so it is pinned to the real grant, not task.cpus
-    export TRACS_GATHER_CORES=\$CORES
+    # patched tracs package shadows the container's (see containers/tracs-align/README.md)
+    export PYTHONPATH="\$PWD/${tracs_overlay}"
+    export PYTHONDONTWRITEBYTECODE=1
 
-    # tracs aligns matched references one at a time by default; this runs several
-    # concurrently instead. 2 workers is the efficient default: on the worst measured sample
-    # it used fewer node-hours than higher worker counts while still cutting wall time ~3x -
-    # more workers finish a single job faster but use the node's paid-for share less
-    # efficiently across the whole batch. That trade only pays off where 2 workers would not
-    # finish inside the 24h the `work` queue allows, which TRACS_GATHER now tells us in
-    # advance, so the 5-worker bump goes to exactly those (benchmarked in
-    # /scratch/pawsey1172/zkhurram/tracs_v2_test/prod_run vs prod_run_w2 - cut the worst-case
-    # sample from 233min to 128min, peak mem 50.7GB vs 25GB; memory follows in
-    # nextflow.config). A retry means the estimate was low, so it bumps regardless.
-    export TRACS_ALIGN_WORKERS=${task.attempt > 1 || work_units >= params.tracs_work_boost ? 5 : 2}
+    # TRACS_GATHER already ran the gather (fastgather) on these reads, so its csv is handed
+    # over and the sketch + gather are skipped here. TRACS_GATHER_CORES would only matter if
+    # the csv were missing and align had to gather itself.
+    export TRACS_GATHER_CORES=\$CORES
+    export TRACS_GATHER_CSV="\$PWD/${gather_csv}"
+
+    # One minimap2 pass against all ${refcount} matched references at once finds which
+    # reads can align to which reference; each per-reference alignment then only sees
+    # those reads instead of the whole read set (the alignment stage used to cost
+    # references x reads). A read reported against more than MAX_HITS references is
+    # aligned to all of them, so no reference ever misses a read it would have aligned.
+    # The cap trades screen output volume against promiscuous reads: measured on the same
+    # inputs, 200 beat 50 on a 39-reference sample (22 vs 25 min; 163 vs 143k promiscuous
+    # pairs) while 50 beat 200 on a 261-reference sample (29 vs 40 min), so it scales as
+    # ~8000/references, clamped to [50, 200]. Outputs are identical at any cap.
+    export TRACS_SCREEN=1
+    export TRACS_SCREEN_MAX_HITS=\$(( 8000 / ${refcount} > 200 ? 200 : (8000 / ${refcount} < 50 ? 50 : 8000 / ${refcount}) ))
+
+    # Per-reference alignments are small once screened, so run many at once with few
+    # threads each (samtools sort is capped at 256M/thread inside tracs, so 12 workers stay
+    # well under 20 GB). The posterior stage (pure python, one reference at a time
+    # upstream) runs in a process pool and is now the longest phase on reference-rich
+    # samples (9 of 16.5 min on a 179-reference sample at 6 workers); each worker holds
+    # ~1-2 GB for a large genome, hence the cap of 8 inside a 20 GB request.
+    export TRACS_ALIGN_WORKERS=\$(( CORES / 2 > 2 ? CORES / 2 : 2 ))
+    export TRACS_POSTERIOR_WORKERS=\$(( CORES < 8 ? CORES : 8 ))
 
     tracs align \\
         -i ${input_reads} \\
