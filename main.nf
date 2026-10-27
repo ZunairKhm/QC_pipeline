@@ -312,14 +312,11 @@ if (params.runtracsalign) {
     }
     tracs_refseqs_ch  = Channel.value(file(params.tracs_refseqs))
     tracs_database_ch = Channel.value(file(params.tracs_database))
-    // Patched tracs python package, laid over the container's copy via PYTHONPATH - see
-    // containers/tracs-align/README.md. Staged as an input so singularity binds it.
-    tracs_overlay_ch  = Channel.value(file("${projectDir}/containers/tracs-align/overlay"))
 
     // Reference selection is pulled out ahead of the alignment: it records how much work
     // each sample is (references x input GB) and its gather result is handed to the
     // alignment so the reads are not sketched and gathered a second time.
-    TRACS_GATHER(FASTP.out.reads, tracs_database_ch, tracs_overlay_ch)
+    TRACS_GATHER(FASTP.out.reads, tracs_database_ch)
 
     tracs_sized_ch = TRACS_GATHER.out.sized.map { meta, fq, csv, refcount, input_gb ->
         def rc = refcount as Integer
@@ -334,7 +331,7 @@ if (params.runtracsalign) {
                      storeDir: "${params.outdir}/metadata",
                      seed: "sample\trefcount\tinput_gb")
 
-    TRACS_ALIGN(tracs_sized_ch, tracs_refseqs_ch, tracs_database_ch, tracs_overlay_ch)
+    TRACS_ALIGN(tracs_sized_ch, tracs_refseqs_ch, tracs_database_ch)
 
     TRACS_ALIGN.out.align_out.view { meta, dir -> "TRACS align: ${meta.id} -> ${dir.name}" }
     TRACS_ALIGN.out.align_out.map { meta, _dir -> meta.id }
@@ -451,7 +448,6 @@ process TRACS_GATHER {
     input:
     tuple val(meta), path(fq_files)
     path(tracs_database)
-    path(tracs_overlay)
 
     output:
     // the gather csv goes to TRACS_ALIGN so it is not recomputed there
@@ -468,13 +464,11 @@ process TRACS_GATHER {
     # fastgather (branchwater), as batches 00-06 used, rather than upstream's classic gather:
     # it can break ties differently and shift the reference set by one or two on diverse
     # samples, but keeps new batches consistent with the old ones and avoids classic gather's
-    # 8-20 min (up to hours) single-threaded run. utils.py silently falls back to classic
-    # gather when the plugin is missing, so its absence is made an error here instead.
+    # 8-20 min (up to hours) single-threaded run. The image's tracs gathers classically
+    # unless TRACS_FASTGATHER=1, and silently falls back to classic gather when the plugin
+    # is missing, so its absence is made an error here instead.
     export TRACS_FASTGATHER=1
     python3 -c 'import sourmash_plugin_branchwater' || { echo "sourmash_plugin_branchwater missing - fastgather unavailable" >&2; exit 1; }
-    # patched tracs package shadows the container's (see containers/tracs-align/README.md)
-    export PYTHONPATH="\$PWD/${tracs_overlay}"
-    export PYTHONDONTWRITEBYTECODE=1
 
     # Calls tracs' own run_gather rather than reimplementing sketch+fastgather here. The
     # reference list is not the gather csv, it is that csv after the p_match / coverage-ratio
@@ -523,7 +517,6 @@ process TRACS_ALIGN {
     tuple val(meta), path(fq_files), path(gather_csv), val(refcount), val(work_units)
     path(tracs_refseqs)
     path(tracs_database)
-    path(tracs_overlay)
 
     output:
     tuple val(meta), path("${meta.id}"), emit: align_out
@@ -543,10 +536,6 @@ process TRACS_ALIGN {
     # (it runs `env - PATH=... singularity exec ...`) - so neither reflects the true grant.
     # nproc reads the cgroup CPU affinity directly, which is unaffected by either problem.
     CORES=\$(nproc)
-
-    # patched tracs package shadows the container's (see containers/tracs-align/README.md)
-    export PYTHONPATH="\$PWD/${tracs_overlay}"
-    export PYTHONDONTWRITEBYTECODE=1
 
     # TRACS_GATHER already ran the gather (fastgather) on these reads, so its csv is handed
     # over and the sketch + gather are skipped here. TRACS_GATHER_CORES would only matter if
