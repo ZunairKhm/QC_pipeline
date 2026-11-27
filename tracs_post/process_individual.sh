@@ -56,7 +56,7 @@ done
 if [[ -s "${work}/msas.txt" ]]; then
     singularity exec "${img}" tracs distance --msa $(cat "${work}/msas.txt") --filter \
         -D "${SNP_THRESHOLD:-5000}" \
-        -t 1 -o "${work}/distances.csv" --loglevel WARNING
+        -t "${threads}" -o "${work}/distances.csv" --loglevel WARNING
 else
     echo "sampleA,sampleB,date difference,SNP distance,transmission distance,expected K,filtered SNP distance,sites considered,MSA file" \
         > "${work}/distances.csv"

@@ -5,9 +5,9 @@
 #
 # From the QC_pipeline directory, after build_chunks.py (and ideally after the
 # within-individual run, so build_background.py can use frac_N):
-#   python3 tracs_post/build_background.py          # prints the --array range to use
-#   sbatch --array=0-N%40 tracs_post/tracs_background.sbatch
-#   python3 tracs_post/merge_distances.py           # merges within + background
+#   python3 tracs_post/build_background.py --run-dir $RUN   # prints the full sbatch line to use
+#   (it exports RUN_DIR and sends logs to $RUN/background/logs/; RUN_DIR is required)
+#   python3 tracs_post/merge_distances.py --run-dir $RUN    # merges within + background
 #
 # Cost: --filter is very slow on far-apart between-person pairs (>2 CPU-hours for one
 # 141-sample reference without -D), so SNP_THRESHOLD (default 5000) is passed as -D,
@@ -22,7 +22,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=28GB
 #SBATCH --time=02:00:00
-#SBATCH --output=results/tracs_distance/background/logs/%A_%a.out
+#SBATCH --output=%x-%A_%a.out
 
 if [ "x$SLURM_JOB_ID" == "x" ]; then
    echo "You need to submit your job to the queuing system with sbatch"
@@ -34,7 +34,7 @@ module load singularity/4.1.0-slurm
 module load squashfs/4.6.1
 
 PIPE=$(realpath "${SLURM_SUBMIT_DIR}")
-OUTDIR=${OUTDIR:-${PIPE}/results/tracs_distance}
+OUTDIR=${RUN_DIR:?set RUN_DIR (sbatch --export=ALL,RUN_DIR=<run folder>)}
 BGDIR=${OUTDIR}/background
 CHUNK=$(printf '%s/chunks/chunk_%04d.tsv' "${BGDIR}" "${SLURM_ARRAY_TASK_ID}")
 PARALLEL=${PARALLEL:-4}                                   # references at once
@@ -42,6 +42,8 @@ THREADS=$(( SLURM_CPUS_PER_TASK / PARALLEL > 0 ? SLURM_CPUS_PER_TASK / PARALLEL 
 
 export TRACS_IMG=${PIPE}/singularity/zunairkhm-tracs-align-v3.0.img
 export WORK_ROOT=/dev/shm/tracs_bg_${SLURM_JOB_ID}
+# -D: SNP_THRESHOLD if exported, else the run's snp_threshold (run_config.tsv), else 5000
+SNP_THRESHOLD=${SNP_THRESHOLD:-$(awk -F'\t' '$1=="snp_threshold"{print $2}' "${OUTDIR}/run_config.tsv" 2>/dev/null)}
 export SNP_THRESHOLD=${SNP_THRESHOLD:-5000}
 trap 'rm -rf "${WORK_ROOT}"' EXIT
 

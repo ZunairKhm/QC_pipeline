@@ -5,7 +5,8 @@ per_individual/<id>/distances.csv has every within-person pair on every referenc
 writes the same rows split by reference into per_reference/<ref>.csv, named with the
 versioned accession like background/per_ref/<ref>.csv, so the two can be paired up per
 reference. The columns are tracs distance's own, with "date difference" filled in
-(days, from cmd_sample_times.tsv, see export_cmd_times.R), so a file can go straight into
+(days, from <run>/sample_times.tsv: cMD via export_cmd_times.R, metalog via prepare_run.py),
+so a file can go straight into
 mxsure_input_tracs(), plus:
   individual, study, body_site_A/B, time_source, frac_N_A/B
   longitudinal   TRUE if the pair counts as a longitudinal comparison for mxsure:
@@ -19,8 +20,9 @@ per_reference/summary.tsv, one row per reference: pairs, longitudinal pairs and 
 individuals they come from, the background's state, and `eligible` (>= --min-comparisons
 longitudinal pairs and a finished background). mxsure_rates.R runs on the eligible ones.
 
-Run from QC_pipeline/ after the within-individual run (and export_cmd_times.R). Always
-rebuilt from everything on disk, so re-run it once more of the background has finished.
+Run from QC_pipeline/ after the within-individual run. --max-frac-n and --min-sites default to the
+run's run_config.tsv. Always rebuilt from everything on disk, so re-run it once more of
+the background has finished.
 """
 import argparse
 import csv
@@ -29,31 +31,45 @@ import os
 import sys
 from collections import defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import sources as S
+
 p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-p.add_argument("--outdir", default="results/tracs_distance")
-p.add_argument("--times", default=None, help="default: <outdir>/cmd_sample_times.tsv")
-p.add_argument("--units-glob", default="results/metadata/units.batch*.tsv")
-p.add_argument("--max-frac-n", type=float, default=0.75,
-               help="longitudinal pairs need frac_N <= this in both samples (as build_background.py)")
-p.add_argument("--min-sites", type=int, default=0, help="longitudinal pairs need sites considered >= this")
-p.add_argument("--snp-threshold", type=int, default=5000, help="raw SNP distance cap (the runs' -D)")
+p.add_argument("--run-dir", required=True)
+p.add_argument("--times", default=None, help="default: <run>/sample_times.tsv")
+p.add_argument("--max-frac-n", type=float, default=None,
+               help="longitudinal pairs need frac_N <= this in both samples (default: the run's max_frac_n)")
+p.add_argument("--min-sites", type=int, default=None,
+               help="longitudinal pairs need sites considered >= this (default: the run's min_sites, else 0)")
+p.add_argument("--snp-threshold", type=int, default=None,
+               help="raw SNP distance cap (default: the run's snp_threshold, i.e. its -D)")
+p.add_argument("--min-called", type=float, default=None,
+               help="longitudinal pairs need frac_called >= this in both samples (default: the run's "
+                    "min_called, else 0)")
 p.add_argument("--min-comparisons", type=int, default=30,
                help="longitudinal pairs needed for a reference to be eligible")
 args = p.parse_args()
+args.outdir = args.run_dir
+cfg = S.read_config(args.outdir)
+if args.snp_threshold is None:
+    args.snp_threshold = int(cfg.get("snp_threshold", 5000))
+if args.max_frac_n is None:
+    args.max_frac_n = float(cfg["max_frac_n"])
+if args.min_sites is None:
+    args.min_sites = int(cfg.get("min_sites", 0))
+if args.min_called is None:
+    args.min_called = float(cfg.get("min_called", 0))
+called = S.load_called()
 
 unver = lambda acc: acc.split(".")[0]
 per_ref_dir = os.path.join(args.outdir, "per_reference")
 bg_dir = os.path.join(args.outdir, "background", "per_ref")
 
 # --- unit -> runs -> sampling time ------------------------------------------------------
-unit_runs = defaultdict(list)
-for f in sorted(glob.glob(args.units_glob)):
-    with open(f) as fh:
-        for r in csv.DictReader(fh, delimiter="\t"):
-            unit_runs[r["unit_id"]].append(r["run"])
+unit_runs = {u: sorted(rs) for u, rs in S.unit_runs(S.run_sources(args.outdir))[0].items()}
 
 run_time = {}
-with open(args.times or os.path.join(args.outdir, "cmd_sample_times.tsv")) as fh:
+with open(args.times or os.path.join(args.outdir, "sample_times.tsv")) as fh:
     for r in csv.DictReader(fh, delimiter="\t"):
         run_time[r["run"]] = r
 
@@ -65,7 +81,7 @@ with open(os.path.join(args.outdir, "index.tsv")) as fh:
 
 
 def unit_info(unit):
-    """cMD row for a unit (its first run with metadata; a unit is one cMD sample)."""
+    """metadata row for a unit (its first run with metadata; a unit is one biological sample)."""
     for run in unit_runs.get(unit, [unit]):
         if run in run_time:
             return run_time[run]
@@ -76,7 +92,7 @@ def pair_time(a, b):
     """(days apart, which time scale) or (None, reason)."""
     ia, ib = unit_info(a), unit_info(b)
     if ia is None or ib is None:
-        return None, "no_cmd_metadata"
+        return None, "no_metadata"
     for col in ("days_from_first_collection", "infant_age"):
         if not na(ia[col]) and not na(ib[col]):
             return abs(float(ia[col]) - float(ib[col])), col
@@ -101,7 +117,7 @@ for d in done:
 TRACS_COLS = ["sampleA", "sampleB", "date difference", "SNP distance", "transmission distance",
               "expected K", "filtered SNP distance", "sites considered", "MSA file"]
 EXTRA = ["individual", "study", "body_site_A", "body_site_B", "time_source", "frac_N_A", "frac_N_B",
-         "longitudinal"]
+         "frac_called_A", "frac_called_B", "longitudinal"]
 rows = defaultdict(list)
 untimed = defaultdict(int)
 for d in done:
@@ -113,6 +129,7 @@ for d in done:
                 untimed[src] += 1
             ia, ib = unit_info(a) or {}, unit_info(b) or {}
             fa, fb = frac_n.get((a, acc), "NA"), frac_n.get((b, acc), "NA")
+            ca, cb = called.get((a, unver(acc))), called.get((b, unver(acc)))
             sites = int(r["sites considered"])
             longitudinal = (
                 t is not None and t > 0
@@ -120,6 +137,8 @@ for d in done:
                 and not na(fa) and not na(fb)
                 and float(fa) <= args.max_frac_n and float(fb) <= args.max_frac_n
                 and sites >= args.min_sites
+                and ca is not None and cb is not None
+                and ca >= args.min_called and cb >= args.min_called
                 and not na(r["filtered SNP distance"])
                 and int(r["SNP distance"]) <= args.snp_threshold
             )
@@ -127,7 +146,9 @@ for d in done:
             r["date difference"] = "NA" if t is None else f"{t:g}"
             rows[acc].append([r[c] for c in TRACS_COLS] + [
                 ind, ind.split("::")[0], ia.get("body_site", "NA"), ib.get("body_site", "NA"),
-                src if t is not None else "NA", fa, fb, "TRUE" if longitudinal else "FALSE"])
+                src if t is not None else "NA", fa, fb,
+                "NA" if ca is None else f"{ca:.4f}", "NA" if cb is None else f"{cb:.4f}",
+                "TRUE" if longitudinal else "FALSE"])
 
 os.makedirs(per_ref_dir, exist_ok=True)
 for f in glob.glob(os.path.join(per_ref_dir, "*.csv")):
@@ -162,6 +183,7 @@ with open(os.path.join(per_ref_dir, "summary.tsv"), "w") as fh:
 
 n_pairs = sum(len(v) for v in rows.values())
 enough = [s for s in summary if s[4] >= args.min_comparisons]
+print(f"max_frac_n = {args.max_frac_n:g}, min_sites = {args.min_sites}, min_called = {args.min_called:g}")
 print(f"{len(done)} individuals, {n_pairs} pairs over {len(rows)} references -> {per_ref_dir}/")
 print(f"  pairs without a sampling time: {sum(untimed.values())} {dict(untimed)}")
 print(f"  references with >= {args.min_comparisons} longitudinal pairs: {len(enough)}; eligible "

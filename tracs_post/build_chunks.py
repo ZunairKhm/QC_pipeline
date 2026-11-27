@@ -5,50 +5,51 @@ Only within-individual comparisons are wanted, so combine+distance run per indiv
 ~9k sample pairs in total, versus millions if every sample sharing a reference were
 compared. Each individual's samples are read once, so I/O is the same as a global run.
 
-Inputs:
-  sample_individual.tsv        run -> individual
-  results/metadata/units.*.tsv unit_id (= tracs sample dir name) -> runs
-  results/tracs_align_squash/*.sqfs  (and optionally results/tracs_align/ for
-                                      samples not yet squashed)
+Inputs (from the run folder made by prepare_run.py):
+  <run>/sample_individual.tsv  run -> individual
+  <run>/sources.tsv            units.batch*.tsv globs (unit_id -> runs) and .sqfs images per source
+  (and optionally results/tracs_align/ for samples not yet squashed)
 
-Outputs (under --outdir):
+Outputs (under <run>/):
   index.tsv              every aligned unit with its individual and where it lives
   chunks/chunk_NNNN.tsv  one line per unit: safe_id, individual, unit, source
                          (source = the .sqfs holding it, or the unsquashed sample dir)
 
 Individuals already finished (per_individual/<safe_id>/units.txt matches their current
-unit list) are skipped, so re-running this after more samples land only redoes the
-individuals whose sample set changed.
+unit list) are skipped. With --reuse-from <dir>, finished individuals in <dir>/per_individual
+whose unit list matches are copied in first (the within-individual distances don't depend on
+frac_N or on other people, so they carry over between runs).
 """
 import argparse
 import csv
-import glob
 import math
 import os
 import re
 import shutil
-import subprocess
 import sys
 from collections import defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import sources as S
+
 p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-p.add_argument("--individuals", default="sample_individual.tsv")
-p.add_argument("--units", default="results/metadata/units.batch*.tsv", help="glob")
-p.add_argument("--squash-dir", default="results/tracs_align_squash")
+p.add_argument("--run-dir", required=True)
+p.add_argument("--reuse-from", default=None,
+               help="earlier run folder (or legacy results/tracs_distance) whose per_individual/ to reuse")
 p.add_argument("--unsquashed-dir", default="results/tracs_align",
                help="used only with --include-unsquashed")
 p.add_argument("--include-unsquashed", action="store_true",
                help="also use sample dirs not yet packed into a .sqfs (only do this once "
                     "the batch that wrote them has finished, or dirs may be incomplete)")
-p.add_argument("--outdir", default="results/tracs_distance")
 p.add_argument("--units-per-chunk", type=int, default=150)
 p.add_argument("--min-units", type=int, default=2, help="skip individuals with fewer units")
 p.add_argument("--limit-individuals", type=int, default=0,
                help="only chunk the N smallest todo individuals (for a test run)")
 args = p.parse_args()
 
-outdir = os.path.realpath(args.outdir)
-os.makedirs(os.path.join(outdir, "logs"), exist_ok=True)  # sbatch --output lands here
+outdir = os.path.realpath(args.run_dir)
+srcs = S.run_sources(outdir)
+S.read_config(outdir)  # must exist
 
 
 def safe_name(s):
@@ -56,12 +57,9 @@ def safe_name(s):
 
 
 # --- unit -> individual -------------------------------------------------------------
-run_ind = {r["run"]: r["individual"]
-           for r in csv.DictReader(open(args.individuals), delimiter="\t")}
-unit_runs = defaultdict(set)
-for f in sorted(glob.glob(args.units)):
-    for r in csv.DictReader(open(f), delimiter="\t"):
-        unit_runs[r["unit_id"]].add(r["run"])
+with open(os.path.join(outdir, "sample_individual.tsv")) as fh:
+    run_ind = {r["run"]: r["individual"] for r in csv.DictReader(fh, delimiter="\t")}
+unit_runs, unit_src = S.unit_runs(srcs)
 
 unit_ind, no_ind = {}, []
 for unit, runs in unit_runs.items():
@@ -74,25 +72,14 @@ for unit, runs in unit_runs.items():
         no_ind.append(unit)
 
 # --- where each unit's tracs output lives -------------------------------------------
-unsquashfs = "/usr/bin/unsquashfs" if os.access("/usr/bin/unsquashfs", os.X_OK) else "unsquashfs"
-listing_dir = os.path.join(outdir, ".sqfs_listing")
-os.makedirs(listing_dir, exist_ok=True)
-
 unit_path = {}  # unit -> .sqfs image, or the sample dir itself if not squashed
-for img in sorted(glob.glob(os.path.join(args.squash_dir, "*.sqfs"))):
-    img = os.path.realpath(img)
-    stem = os.path.basename(img)[: -len(".sqfs")]
-    # listing an image takes ~15s, so cache it until the image changes
-    cache = os.path.join(listing_dir, stem + ".txt")
-    if not os.path.exists(cache) or os.path.getmtime(cache) < os.path.getmtime(img):
-        print(f"listing {img} ...", file=sys.stderr)
-        out = subprocess.run([unsquashfs, "-l", "-max-depth", "1", img],
-                             check=True, capture_output=True, text=True).stdout
-        names = [l.split("/", 1)[1] for l in out.splitlines() if l.startswith("squashfs-root/")]
-        with open(cache, "w") as fh:
-            fh.write("\n".join(names) + "\n")
-    for name in open(cache).read().split():
-        unit_path.setdefault(name, img)
+for s in srcs:
+    imgs = S.images(s)
+    if not imgs:
+        print(f"WARNING: source {s['name']}: no image matches {s['squash']}", file=sys.stderr)
+    for img in imgs:
+        for name in S.list_units(img):
+            unit_path.setdefault(name, img)
 
 if args.include_unsquashed and os.path.isdir(args.unsquashed_dir):
     src = os.path.realpath(args.unsquashed_dir)
@@ -121,18 +108,37 @@ with open(os.path.join(outdir, "index.tsv"), "w") as fh:
             fh.write(f"{unit}\t{ind}\t{safe_of[ind]}\t{path}\n")
 
 
-def is_done(ind):
-    d = os.path.join(outdir, "per_individual", safe_of[ind])
+def finished(base, ind):
+    d = os.path.join(base, "per_individual", safe_of[ind])
     try:
         done_units = open(os.path.join(d, "units.txt")).read().split()
     except FileNotFoundError:
         return False
     return (sorted(done_units) == sorted(u for u, _ in groups[ind])
-            and os.path.exists(os.path.join(d, "distances.csv")))
+            and os.path.exists(os.path.join(d, "distances.csv"))
+            and os.path.exists(os.path.join(d, "combined_metadata.csv")))
 
 
 eligible = [i for i in groups if len(groups[i]) >= args.min_units]
-todo = [i for i in eligible if not is_done(i)]
+n_reused = 0
+if args.reuse_from:
+    reuse = os.path.realpath(args.reuse_from)
+    if reuse == outdir:
+        sys.exit("ERROR: --reuse-from is the run folder itself")
+    for ind in eligible:
+        if not finished(outdir, ind) and finished(reuse, ind):
+            dst = os.path.join(outdir, "per_individual", safe_of[ind])
+            shutil.rmtree(dst, ignore_errors=True)
+            os.makedirs(dst)
+            src = os.path.join(reuse, "per_individual", safe_of[ind])
+            for f in ("distances.csv", "combined_metadata.csv", "combined.tar"):
+                if os.path.exists(os.path.join(src, f)):
+                    shutil.copy2(os.path.join(src, f), dst)
+            shutil.copy2(os.path.join(src, "units.txt"), dst)  # last = done
+            n_reused += 1
+
+done = [i for i in eligible if finished(outdir, i)]
+todo = [i for i in eligible if not finished(outdir, i)]
 if args.limit_individuals:
     todo = sorted(todo, key=lambda i: len(groups[i]))[: args.limit_individuals]
 
@@ -155,10 +161,19 @@ for k, inds in enumerate(chunks):
                 fh.write(f"{safe_of[ind]}\t{ind}\t{unit}\t{path}\n")
 
 aligned_no_ind = sum(1 for u in unit_path if u not in unit_ind)
+not_aligned = sum(1 for u in unit_ind if u not in unit_path)
 print(f"aligned units found:         {len(unit_path)}  ({aligned_no_ind} have no individual, skipped)")
+print(f"units with an individual but no TRACS output in any image: {not_aligned}")
+per_src = defaultdict(lambda: [0, set()])
+for ind in eligible:
+    for u, _ in groups[ind]:
+        per_src[unit_src.get(u, "?")][0] += 1
+        per_src[unit_src.get(u, "?")][1].add(ind)
+for s, (nu, inds) in sorted(per_src.items()):
+    print(f"  {s}: {nu} units in {len(inds)} individuals with >= {args.min_units} units")
 print(f"individuals with >= {args.min_units} units: {len(eligible)}  "
       f"(+{len(groups) - len(eligible)} with fewer, skipped)")
-print(f"already done:                {len(eligible) - len([i for i in eligible if not is_done(i)])}")
+print(f"already done:                {len(done)}" + (f"  ({n_reused} copied from {args.reuse_from})" if args.reuse_from else ""))
 print(f"to run:                      {len(todo)} individuals, {n_units} units, {n_chunks} chunks")
 if n_chunks:
-    print(f"\nsubmit with:\n  sbatch --array=0-{n_chunks - 1}%50 tracs_post/tracs_combine_distance.sbatch")
+    print("\nsubmit with:\n  " + S.sbatch_cmd("tracs_post/tracs_combine_distance.sbatch", n_chunks, outdir, "logs"))

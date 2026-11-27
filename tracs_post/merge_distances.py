@@ -6,7 +6,8 @@ One row per (sample pair, reference), with `comparison` set to
   between_same_study   different people, same study (some studies sampled families)
   between_study        different people, different studies
 and each sample's frac_N for that reference, the species name, and filtered SNPs per Mb
-of sites compared. Low coverage makes SNP distances look small, so filter on
+of sites compared. No frac_N filter is applied here (the run's max_frac_n is used by the
+background selection and mxsure only). Low coverage makes SNP distances look small, so filter on
 sites_considered and frac_N before calling anything the same strain.
 
 Both runs use tracs distance -D 5000, which drops pairs whose RAW snp_distance is above
@@ -28,11 +29,21 @@ import sys
 from collections import defaultdict
 
 p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-p.add_argument("--outdir", default="results/tracs_distance")
-p.add_argument("--snp-threshold", type=int, default=5000,
-               help="drop pairs with raw SNP distance above this (match the runs' -D)")
+p.add_argument("--run-dir", "--outdir", dest="outdir", required=True,
+               help="run folder (results/tracs_distance/run-YYYY-MM-DD)")
+p.add_argument("--snp-threshold", type=int, default=None,
+               help="drop pairs with raw SNP distance above this (default: the run's snp_threshold, its -D)")
 p.add_argument("-o", "--output", default=None, help="default: <outdir>/all_distances.tsv.gz")
 args = p.parse_args()
+if args.snp_threshold is None:  # the run's -D (run_config.tsv); legacy folders without one used 5000
+    args.snp_threshold = 5000
+    cfg_path = os.path.join(args.outdir, "run_config.tsv")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as fh:
+            for line in fh:
+                k, _, v = line.rstrip("\n").partition("\t")
+                if k == "snp_threshold":
+                    args.snp_threshold = int(v)
 
 out_path = args.output or os.path.join(args.outdir, "all_distances.tsv.gz")
 unver = lambda acc: acc.split(".")[0]

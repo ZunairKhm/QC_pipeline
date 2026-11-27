@@ -1,0 +1,7 @@
+# Data sources for tracs_post (see sources.py). One line per source; paths relative to QC_pipeline/.
+# To add a metalog study: run the pipeline with its own results dir, squash its tracs_align into
+# results/tracs_align_squash/<name>/, and add a line here with metadata=metalog.
+name	units_glob	squash	metadata
+cmd	results/metadata/units.batch*.tsv	results/tracs_align_squash/tracs_align_batch*.sqfs	cmd
+olsson	results/olsson*/metadata/units.batch*.tsv	results/tracs_align_squash/olsson/*.sqfs	metalog
+yaffe	results/yaffe/metadata/units.batch*.tsv	results/tracs_align_squash/yaffe/*.sqfs	metalog

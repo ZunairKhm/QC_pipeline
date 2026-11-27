@@ -6,7 +6,10 @@
 #             frac_N <= MAX_FRAC_N for both samples, sites considered >= MIN_SITES
 #             (same-study pairs are left out: some studies sampled families)
 # Filtered SNP distances throughout, sites considered as mixed_sites, so lambda is in
-# SNPs/site/year (lambda_per_genome = lambda x mean sites). CIs bootstrap pairs.
+# SNPs/site/year (lambda_per_genome = lambda x mean sites). CIs bootstrap whole individuals
+# (mxsure_ci cluster_id = individual), since one person's pairs share samples and strains;
+# CLUSTER_BOOTSTRAP=0 goes back to resampling pairs (runs up to run-2026-11-11 did that).
+# The time randomisation test's own shuffled-data bootstraps still resample pairs.
 # Time randomisation test (mxsure_timerandtest): the mixed set's times are shuffled
 # TIMERAND_PERMUTATIONS times and refitted with TIMERAND_BOOTSTRAPS bootstraps each; if the
 # rate is driven by time, the shuffled estimates fall well below the real one. timerand_fail
@@ -14,25 +17,29 @@
 # timerand_pass = no shuffled 95% CI reaches the real estimate. Plots -> mxsure/plots/.
 #
 # usage (from QC_pipeline/, module load r/4.4.1):
-#   Rscript tracs_post/mxsure_rates.R run <ref> [<ref> ...]   # -> mxsure/per_ref/<ref>.{tsv,rds}
-#   Rscript tracs_post/mxsure_rates.R combine                 # -> mxsure/rates.tsv
+#   RUN_DIR=<run> Rscript tracs_post/mxsure_rates.R run <ref> [<ref> ...]   # -> mxsure/per_ref/<ref>.{tsv,rds}
+#   RUN_DIR=<run> Rscript tracs_post/mxsure_rates.R combine                 # -> mxsure/rates.tsv
 # A reference with an existing .tsv is skipped (delete it to redo).
-# env: OUTDIR (results/tracs_distance), BOOTSTRAPS (500), RIGHT_TRUNCATION (5000),
-#      THRESHOLD_DAYS (365.25), MAX_FRAC_N (0.75), MIN_SITES (0), WORKERS (SLURM_CPUS_PER_TASK),
-#      TIMERAND_PERMUTATIONS (10; 0 skips the test), TIMERAND_BOOTSTRAPS (100)
+# env: RUN_DIR (required; the run folder), BOOTSTRAPS (500), RIGHT_TRUNCATION (default: right_truncation in run_config.tsv, else 5000; filtered SNPs),
+#      THRESHOLD_DAYS (365.25), MAX_FRAC_N (default: max_frac_n in <run>/run_config.tsv), MIN_SITES (default: min_sites in run_config.tsv, else 0), WORKERS (SLURM_CPUS_PER_TASK),
+#      TIMERAND_PERMUTATIONS (10; 0 skips the test), TIMERAND_BOOTSTRAPS (100), CLUSTER_BOOTSTRAP (1)
 suppressPackageStartupMessages({
   library(data.table)
   library(mxsure)
   library(future)
 })
 env <- function(k, d) { v <- Sys.getenv(k); if (v == "") d else v }
-outdir     <- env("OUTDIR", "results/tracs_distance")
+outdir     <- env("RUN_DIR", env("OUTDIR", ""))
+if (outdir == "") stop("set RUN_DIR to the run folder (results/tracs_distance/run-YYYY-MM-DD)")
+run_cfg    <- fread(file.path(outdir, "run_config.tsv"))[, setNames(value, key)]
 bootstraps <- as.integer(env("BOOTSTRAPS", 500))
-right_trunc <- as.numeric(env("RIGHT_TRUNCATION", 5000))
+right_trunc <- as.numeric(env("RIGHT_TRUNCATION", if ("right_truncation" %in% names(run_cfg)) run_cfg[["right_truncation"]] else 5000))
 thresh_days <- as.numeric(env("THRESHOLD_DAYS", 365.25))
-max_frac_n <- as.numeric(env("MAX_FRAC_N", 0.75))
-min_sites  <- as.numeric(env("MIN_SITES", 0))
+max_frac_n <- as.numeric(env("MAX_FRAC_N", run_cfg[["max_frac_n"]]))
+min_called <- as.numeric(env("MIN_CALLED", if ("min_called" %in% names(run_cfg)) run_cfg[["min_called"]] else 0))
+min_sites  <- as.numeric(env("MIN_SITES", if ("min_sites" %in% names(run_cfg)) run_cfg[["min_sites"]] else 0))
 workers    <- as.integer(env("WORKERS", env("SLURM_CPUS_PER_TASK", 1)))
+cluster_boot <- env("CLUSTER_BOOTSTRAP", "1") != "0"
 tr_perms   <- as.integer(env("TIMERAND_PERMUTATIONS", 10))
 tr_boots   <- as.integer(env("TIMERAND_BOOTSTRAPS", 100))
 mx_dir <- file.path(outdir, "mxsure", "per_ref")
@@ -58,6 +65,12 @@ if (mode != "run" || length(args) < 2) stop("usage: mxsure_rates.R run <ref> ...
 
 ref_species <- fread(file.path(outdir, "per_reference", "summary.tsv"))[, setNames(species, reference)]
 unit_study <- fread(file.path(outdir, "index.tsv"))[, .(unit, study = sub("::.*", "", individual))]
+called <- NULL
+if (min_called > 0) {  # base_composition.py tables, shared next to the run folders
+  comp_files <- Sys.glob(file.path(dirname(normalizePath(outdir)), ".base_composition", "*.tsv"))
+  if (!length(comp_files)) stop("min_called > 0 but no .base_composition tables")
+  called <- rbindlist(lapply(comp_files, fread, select = c("unit", "reference", "frac_called")))
+}
 plan(multisession, workers = max(1, workers))
 
 for (ref in args[-1]) {
@@ -76,6 +89,12 @@ for (ref in args[-1]) {
   bg <- merge(bg, setnames(copy(unit_study), c("sampleB", "studyB")), by = "sampleB")
   unrelated <- bg[studyA != studyB & frac_N_A <= max_frac_n & frac_N_B <= max_frac_n &
                     `sites considered` >= min_sites & !is.na(`filtered SNP distance`)]
+  if (!is.null(called)) {
+    cr <- called[reference == ref, .(unit, frac_called)]
+    unrelated <- merge(unrelated, setnames(copy(cr), c("sampleA", "called_A")), by = "sampleA")
+    unrelated <- merge(unrelated, setnames(copy(cr), c("sampleB", "called_B")), by = "sampleB")
+    unrelated <- unrelated[called_A >= min_called & called_B >= min_called]
+  }
 
   result <- tryCatch(
     mxsure_estimate(mixed$`filtered SNP distance`, unrelated$`filtered SNP distance`,
@@ -88,6 +107,7 @@ for (ref in args[-1]) {
       mxsure_ci(mixed$`filtered SNP distance`, unrelated$`filtered SNP distance`,
                 mixed$`date difference`, mixed$`sites considered`,
                 right_truncation = right_trunc, bootstraps = bootstraps,
+                cluster_id = if (cluster_boot) mixed$individual else NA,
                 quiet = TRUE),
       error = function(e) { message(ref, ": mxsure_ci failed: ", conditionMessage(e)); NULL })
   }
@@ -135,7 +155,7 @@ for (ref in args[-1]) {
 
   saveRDS(list(result = result, ci = ci, timerand = timerand, settings = list(
     bootstraps = bootstraps, timerand_permutations = tr_perms, timerand_bootstraps = tr_boots, right_truncation = right_trunc, threshold_days = thresh_days,
-    max_frac_n = max_frac_n, min_sites = min_sites)), file.path(mx_dir, paste0(ref, ".rds")))
+    max_frac_n = max_frac_n, min_sites = min_sites, min_called = min_called, cluster_bootstrap = cluster_boot)), file.path(mx_dir, paste0(ref, ".rds")))
   fwrite(row, out_tsv, sep = "\t", na = "NA")  # written last = done
   cat(sprintf("%s: n=%d (%d people) vs %d unrelated, lambda=%s, timerand fail=%s, %ds\n", ref,
               nrow(mixed), uniqueN(mixed$individual), nrow(unrelated),
